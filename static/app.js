@@ -39,8 +39,11 @@ const paramMeta = {
 };
 
 const statusEl = document.getElementById('status');
-const programInfoEl = document.getElementById('program-info');
 const hardwareInfoEl = document.getElementById('hardware-info');
+const modeSelect = document.getElementById('mode');
+const modeDisplay = document.getElementById('mode-value');
+const colorInput = document.getElementById('dot_color');
+const colorDisplay = document.getElementById('color-value');
 
 function applyParams(params) {
     Object.entries(paramMeta).forEach(([key, config]) => {
@@ -66,16 +69,24 @@ function applyParams(params) {
             paramMeta.r_min.slider.value = params.r_max;
         }
     }
+    if ('mode' in params && modeSelect) {
+        if (modeSelect.value !== params.mode) {
+            modeSelect.value = params.mode;
+        }
+        if (modeDisplay) {
+            modeDisplay.textContent = params.mode.toUpperCase();
+        }
+    }
+    if ('color_hex' in params && colorInput) {
+        const hex = params.color_hex;
+        if (colorInput.value !== hex) {
+            colorInput.value = hex;
+        }
+        if (colorDisplay) {
+            colorDisplay.textContent = hex.toUpperCase();
+        }
+    }
     statusEl.textContent = '';
-}
-
-function applyProgramInfo(items) {
-    programInfoEl.innerHTML = '';
-    items.forEach((txt) => {
-        const li = document.createElement('li');
-        li.textContent = txt;
-        programInfoEl.appendChild(li);
-    });
 }
 
 function applyHardwareInfo(items) {
@@ -98,7 +109,6 @@ function fetchSettings() {
         .then((res) => res.json())
         .then((data) => {
             applyParams(data.params);
-            applyProgramInfo(data.program_settings);
             applyHardwareInfo(data.hardware);
         })
         .catch((err) => {
@@ -147,6 +157,63 @@ document.getElementById('snapshot').addEventListener('click', () => {
             statusEl.textContent = '스냅샷 저장 실패';
             console.error(err);
         });
+});
+
+if (modeSelect) {
+    modeSelect.addEventListener('change', (ev) => {
+        const value = ev.target.value;
+        if (modeDisplay) {
+            modeDisplay.textContent = value.toUpperCase();
+        }
+        sendPartialUpdate('mode', value);
+    });
+    if (modeDisplay) {
+        modeDisplay.textContent = modeSelect.value.toUpperCase();
+    }
+}
+
+if (colorInput) {
+    colorInput.addEventListener('input', (ev) => {
+        const value = ev.target.value;
+        if (colorDisplay) {
+            colorDisplay.textContent = value.toUpperCase();
+        }
+    });
+    colorInput.addEventListener('change', (ev) => {
+        const value = ev.target.value;
+        if (colorDisplay) {
+            colorDisplay.textContent = value.toUpperCase();
+        }
+        sendPartialUpdate('color_hex', value);
+    });
+    if (colorDisplay) {
+        colorDisplay.textContent = colorInput.value.toUpperCase();
+    }
+}
+
+let shutdownRequested = false;
+
+function requestShutdown() {
+    if (shutdownRequested) {
+        return;
+    }
+    shutdownRequested = true;
+    if (navigator.sendBeacon) {
+        const blob = new Blob(['bye'], { type: 'text/plain' });
+        navigator.sendBeacon('/api/shutdown', blob);
+    } else {
+        fetch('/api/shutdown', { method: 'POST', keepalive: true }).catch(() => {});
+    }
+}
+
+window.addEventListener('pagehide', (event) => {
+    if (!event.persisted) {
+        requestShutdown();
+    }
+});
+
+window.addEventListener('beforeunload', () => {
+    requestShutdown();
 });
 
 fetchSettings();

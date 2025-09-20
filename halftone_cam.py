@@ -9,8 +9,10 @@
 import atexit
 import os
 import socket
+import sys
 import threading
 import time
+import webbrowser
 from pathlib import Path
 
 import cv2 as cv
@@ -46,6 +48,8 @@ SAVE_DIR    = Path("halftone_snaps")
 SAVE_DIR.mkdir(exist_ok=True)
 
 PROC_SCALE = 0.5
+HALFTONE_MODES = ("square", "circle", "diamond", "ascii")
+DEFAULT_DOT_COLOR = "#ffffff"
 WEB_HOST = os.getenv("HALFTONE_HOST", "0.0.0.0")
 
 
@@ -80,6 +84,7 @@ def _find_available_port(preferred: int, host: str, attempts: int = 20) -> tuple
     return preferred, False
 
 
+
 WEB_PORT_INPUT = _parse_port(os.getenv("HALFTONE_PORT"), 5050)
 WEB_PORT, WEB_PORT_CHANGED = _find_available_port(WEB_PORT_INPUT, WEB_HOST)
 
@@ -96,20 +101,6 @@ ASCII_LOGO = r"""
 """                                                               
                                                                  
 
-
-
-def _gather_program_settings() -> list[str]:
-    blur_desc = f"{BLUR_KSIZE}" if BLUR_KSIZE and BLUR_KSIZE > 1 else "off"
-    return [
-        f"Camera Index    : {CAP_INDEX}",
-        f"Frame Size      : {FRAME_W}x{FRAME_H}",
-        f"Cell Size       : {CELL}",
-        f"Radius Range    : {R_MIN}~{R_MAX}",
-        f"Gamma           : {GAMMA}",
-        f"Blur Kernel     : {blur_desc}",
-        f"Processing Scale: {PROC_SCALE}",
-        f"Camera Mode     : {'enabled' if USE_CAMERA else 'static demo'}",
-    ]
 
 
 def _gather_acceleration_info() -> list[tuple[str, str]]:
@@ -149,11 +140,6 @@ def _gather_acceleration_info() -> list[tuple[str, str]]:
 def print_startup_banner():
     print(ASCII_LOGO.strip("\n"))
     print("=" * 78)
-    print("PROGRAM SETTINGS")
-    print("-" * 78)
-    for line in _gather_program_settings():
-        print(line)
-    print("=" * 78)
     print("HARDWARE ACCELERATION")
     print("-" * 78)
     for label, status in _gather_acceleration_info():
@@ -174,7 +160,7 @@ def _gaussian_kernel2d(ksize: int, sigma: float | None = None):
     ker = ker / ker.sum()
     return ker.view(1, 1, ksize, ksize)
 
-def halftone_gray_gpu(gray_np: np.ndarray, cell: int, r_min: int, r_max: int, gamma: float, blur_ksize: int, device):
+def halftone_gray_gpu(gray_np: np.ndarray, cell: int, r_min: int, r_max: int, gamma: float, blur_ksize: int, color_bgr: tuple[int, int, int], mode: str, device):
     """
     GPU 텐서 연산 기반 halftone 렌더링.
     입력: gray_np (H,W) uint8
@@ -213,21 +199,33 @@ def halftone_gray_gpu(gray_np: np.ndarray, cell: int, r_min: int, r_max: int, ga
     cx = (ix % cell) - (cell // 2)
     cy = (iy % cell) - (cell // 2)
 
-    # 사각형 판정: max(|dx|, |dy|) <= r  (체비셰프 노름 → 정사각형 도트)
     abs_cx = cx.abs()
     abs_cy = cy.abs()
-    cheb = torch.maximum(abs_cx, abs_cy)
-    mask = (cheb <= r_full).to(torch.uint8)  # (1,1,H,W)
+    mode_lower = mode.lower()
+    if mode_lower == "circle":
+        # 원형: 유클리드 거리 비교 (제곱 거리로 비교)
+        dist2 = abs_cx * abs_cx + abs_cy * abs_cy
+        mask = (dist2 <= (r_full * r_full)).to(torch.uint8)
+    elif mode_lower == "diamond":
+        # 다이아몬드: L1 거리
+        manhattan = abs_cx + abs_cy
+        mask = (manhattan <= r_full).to(torch.uint8)
+    else:
+        # 기본(정사각형): 체비셰프 거리
+        cheb = torch.maximum(abs_cx, abs_cy)
+        mask = (cheb <= r_full).to(torch.uint8)
 
     # 3채널 BGR로 확장 - Matrix 스타일 네온 그린 (B=0, G=255, R=0)
-    g = mask.mul(255)  # green channel
-    z = torch.zeros_like(g)
-    out = torch.cat([z, g, z], dim=1).squeeze(0).permute(1, 2, 0).contiguous()
+    mask_f = mask.to(torch.float32)
+    mask_3 = mask_f.repeat(1, 3, 1, 1)
+    color_tensor = torch.tensor(color_bgr, dtype=torch.float32, device=device).view(1, 3, 1, 1)
+    out = (mask_3 * color_tensor).clamp_(0.0, 255.0)
+    out = out.squeeze(0).permute(1, 2, 0).contiguous().to(torch.uint8)
 
     # CPU로 가져와 numpy 변환
     return out.to("cpu").numpy()
 
-def halftone_gray(gray, cell=CELL, r_min=R_MIN, r_max=R_MAX, gamma=GAMMA, blur_ksize=0):
+def halftone_gray(gray, cell=CELL, r_min=R_MIN, r_max=R_MAX, gamma=GAMMA, blur_ksize=0, color_bgr: tuple[int, int, int] = (255, 255, 255), mode: str = HALFTONE_MODES[0]):
     """
     gray: (H,W) uint8
     반환: halftone BGR 이미지
@@ -250,6 +248,11 @@ def halftone_gray(gray, cell=CELL, r_min=R_MIN, r_max=R_MAX, gamma=GAMMA, blur_k
     out = np.zeros((H, W, 3), dtype=np.uint8)
 
     # 셀 단위로 평균을 구해 반경으로 매핑해서 원을 그린다
+    color_bgr = tuple(max(0, min(255, int(c))) for c in color_bgr)
+    ascii_mode = mode.lower() == "ascii"
+    font = cv.FONT_HERSHEY_SIMPLEX
+    ascii_chars = "@%#*+=-:. "
+
     for y in range(0, H, cell):
         y2 = min(y + cell, H)
         cy = (y + y2) // 2  # 셀 중심 y
@@ -265,15 +268,47 @@ def halftone_gray(gray, cell=CELL, r_min=R_MIN, r_max=R_MAX, gamma=GAMMA, blur_k
             r = r_max * (1.0 - I / 255.0)  # 위에서 감마 적용했으므로 선형
             r = max(r_min, min(r, r_max))
 
+            mode_lower = mode.lower()
+            if ascii_mode:
+                idx = int(round((I / 255.0) * (len(ascii_chars) - 1)))
+                idx = max(0, min(len(ascii_chars) - 1, idx))
+                ch = ascii_chars[idx]
+                font_scale = max(0.3, cell / 20.0)
+                thickness = max(1, int(round(cell / 20.0)))
+                text_size, baseline = cv.getTextSize(ch, font, font_scale, thickness)
+                tx = int(cx - text_size[0] / 2)
+                ty = int(cy + text_size[1] / 2)
+                tx = max(0, min(W - text_size[0], tx))
+                ty = max(text_size[1], min(H - baseline, ty))
+                cv.putText(out, ch, (tx, ty), font, font_scale, color_bgr, thickness, cv.LINE_AA)
+                continue
+
             if r > 0.5:
-                side = int(round(2 * r))  # 정사각형 한 변 길이
-                if side > 0:
-                    half = side // 2
-                    x1 = max(0, cx - half)
-                    y1 = max(0, cy - half)
-                    x2 = min(W - 1, cx + half)
-                    y2 = min(H - 1, cy + half)
-                    cv.rectangle(out, (x1, y1), (x2, y2), (0, 255, 0), thickness=-1)  # 네온 그린(BGR)
+                if mode_lower == "circle":
+                    radius = int(round(r))
+                    if radius > 0:
+                        cv.circle(out, (cx, cy), radius, color_bgr, thickness=-1)
+                elif mode_lower == "diamond":
+                    radius = int(round(r))
+                    if radius > 0:
+                        pts = np.array([
+                            (cx, cy - radius),
+                            (cx + radius, cy),
+                            (cx, cy + radius),
+                            (cx - radius, cy),
+                        ], dtype=np.int32)
+                        pts[:, 0] = np.clip(pts[:, 0], 0, W - 1)
+                        pts[:, 1] = np.clip(pts[:, 1], 0, H - 1)
+                        cv.fillConvexPoly(out, pts, color_bgr)
+                else:
+                    side = int(round(2 * r))  # 정사각형 한 변 길이
+                    if side > 0:
+                        half = side // 2
+                        x1 = max(0, cx - half)
+                        y1 = max(0, cy - half)
+                        x2 = min(W - 1, cx + half)
+                        y2 = min(H - 1, cy + half)
+                        cv.rectangle(out, (x1, y1), (x2, y2), color_bgr, thickness=-1)
 
     return out
 
@@ -283,12 +318,16 @@ def frame_to_gray(frame_bgr):
     return cv.cvtColor(f, cv.COLOR_BGR2GRAY)
 
 
-def overlay_params(img, cell, rmin, rmax, gamma, blur_ksize, fps=None):
+def overlay_params(img, cell, rmin, rmax, gamma, blur_ksize, mode=None, color_hex=None, fps=None):
     """현재 파라미터를 화면 좌상단에 텍스트로 표시."""
     htxt = [
         f"CELL={cell}  R_MIN={rmin}  R_MAX={rmax}",
         f"GAMMA={gamma:.2f}  BLUR_KSIZE={blur_ksize if blur_ksize>0 else 0}",
     ]
+    if mode:
+        htxt.append(f"MODE={mode.upper()}")
+    if color_hex:
+        htxt.append(f"COLOR={color_hex.upper()}")
     if fps is not None:
         htxt.append(f"FPS={fps:.1f}")
     y = 20
@@ -305,6 +344,9 @@ class ParameterState:
         self.r_max = min(R_MAX, CELL // 2)
         self.gamma = GAMMA
         self.blur_level = 0 if (BLUR_KSIZE is None or BLUR_KSIZE < 2) else (BLUR_KSIZE - 1) // 2
+        self.mode = HALFTONE_MODES[0]
+        self.color_hex = DEFAULT_DOT_COLOR
+        self._color_bgr = self._hex_to_bgr(self.color_hex)
 
     def _normalize_locked(self):
         self.cell = int(max(4, min(64, self.cell)))
@@ -312,6 +354,10 @@ class ParameterState:
         self.r_min = int(max(0, min(self.r_min, self.r_max)))
         self.gamma = float(max(0.2, min(3.0, self.gamma)))
         self.blur_level = int(max(0, min(7, self.blur_level)))
+        if self.mode not in HALFTONE_MODES:
+            self.mode = HALFTONE_MODES[0]
+        self.color_hex = self._normalize_hex(self.color_hex)
+        self._color_bgr = self._hex_to_bgr(self.color_hex)
 
     def snapshot(self) -> dict:
         with self.lock:
@@ -323,6 +369,9 @@ class ParameterState:
                 "r_max": self.r_max,
                 "gamma": self.gamma,
                 "blur_level": self.blur_level,
+                "mode": self.mode,
+                "color_hex": self.color_hex,
+                "color_bgr": list(self._color_bgr),
                 "blur_ksize": blur_ksize,
             }
 
@@ -338,6 +387,8 @@ class ParameterState:
                 "r_max": self.r_max,
                 "gamma": self.gamma,
                 "blur_level": self.blur_level,
+                "mode": self.mode,
+                "color_hex": self.color_hex,
             }
 
             if "cell" in payload:
@@ -385,6 +436,22 @@ class ParameterState:
                     self.blur_level = new_val
                     changed.add("blur_level")
 
+            if "mode" in payload:
+                new_val = str(payload["mode"]).lower()
+                if new_val not in HALFTONE_MODES:
+                    new_val = original["mode"]
+                if new_val != self.mode:
+                    self.mode = new_val
+                    changed.add("mode")
+
+            if "color_hex" in payload or "color" in payload:
+                raw = payload.get("color_hex", payload.get("color"))
+                new_hex = self._normalize_hex(str(raw))
+                if new_hex != self.color_hex:
+                    self.color_hex = new_hex
+                    self._color_bgr = self._hex_to_bgr(self.color_hex)
+                    changed.add("color_hex")
+
             self._normalize_locked()
 
             normalized = {
@@ -393,6 +460,8 @@ class ParameterState:
                 "r_max": self.r_max,
                 "gamma": self.gamma,
                 "blur_level": self.blur_level,
+                "mode": self.mode,
+                "color_hex": self.color_hex,
             }
 
         for key, value in normalized.items():
@@ -400,6 +469,31 @@ class ParameterState:
                 changed.add(key)
 
         return sorted(changed)
+
+    @staticmethod
+    def _normalize_hex(value: str, default: str = DEFAULT_DOT_COLOR) -> str:
+        if not isinstance(value, str):
+            return default
+        value = value.strip()
+        if not value:
+            return default
+        if not value.startswith("#"):
+            value = "#" + value
+        if len(value) != 7:
+            return default
+        try:
+            int(value[1:], 16)
+        except ValueError:
+            return default
+        return value.lower()
+
+    @staticmethod
+    def _hex_to_bgr(value: str) -> tuple[int, int, int]:
+        norm = ParameterState._normalize_hex(value)
+        r = int(norm[1:3], 16)
+        g = int(norm[3:5], 16)
+        b = int(norm[5:7], 16)
+        return (b, g, r)
 
 
 class FrameSource:
@@ -470,13 +564,22 @@ class SnapshotBuffer:
             return True, str(path)
 
 
-def render_halftone_frame(gray: np.ndarray, params: dict) -> np.ndarray:
+def render_halftone_frame(gray: np.ndarray, params: dict) -> tuple[np.ndarray, str]:
     cell = params["cell"]
     rmin = params["r_min"]
     rmax = params["r_max"]
     gamma = params["gamma"]
     blur_ksize = params["blur_ksize"]
+    mode = params.get("mode", HALFTONE_MODES[0])
+    mode = mode.lower() if isinstance(mode, str) else HALFTONE_MODES[0]
+    default_bgr = ParameterState._hex_to_bgr(DEFAULT_DOT_COLOR)
+    color_values = params.get("color_bgr", default_bgr)
+    if not isinstance(color_values, (list, tuple)) or len(color_values) != 3:
+        color_values = default_bgr
+    color_bgr = tuple(max(0, min(255, int(c))) for c in color_values)
     use_gpu = TORCH_AVAILABLE and DEVICE is not None and str(DEVICE) in ("cuda", "mps")
+    if mode == "ascii":
+        use_gpu = False
 
     if PROC_SCALE < 1.0:
         W2 = max(64, int(gray.shape[1] * PROC_SCALE))
@@ -493,17 +596,17 @@ def render_halftone_frame(gray: np.ndarray, params: dict) -> np.ndarray:
         else:
             blur_s = 0
         if use_gpu:
-            ht_small = halftone_gray_gpu(gray_s, cell_s, rmin_s, rmax_s, gamma, blur_s, DEVICE)
+            ht_small = halftone_gray_gpu(gray_s, cell_s, rmin_s, rmax_s, gamma, blur_s, color_bgr, mode, DEVICE)
         else:
-            ht_small = halftone_gray(gray_s, cell=cell_s, r_min=rmin_s, r_max=rmax_s, gamma=gamma, blur_ksize=blur_s)
+            ht_small = halftone_gray(gray_s, cell=cell_s, r_min=rmin_s, r_max=rmax_s, gamma=gamma, blur_ksize=blur_s, color_bgr=color_bgr, mode=mode)
         frame = cv.resize(ht_small, (FRAME_W, FRAME_H), interpolation=cv.INTER_NEAREST)
     else:
         if use_gpu:
-            frame = halftone_gray_gpu(gray, cell, rmin, rmax, gamma, blur_ksize, DEVICE)
+            frame = halftone_gray_gpu(gray, cell, rmin, rmax, gamma, blur_ksize, color_bgr, mode, DEVICE)
         else:
-            frame = halftone_gray(gray, cell=cell, r_min=rmin, r_max=rmax, gamma=gamma, blur_ksize=blur_ksize)
+            frame = halftone_gray(gray, cell=cell, r_min=rmin, r_max=rmax, gamma=gamma, blur_ksize=blur_ksize, color_bgr=color_bgr, mode=mode)
 
-    return frame
+    return frame, mode
 
 
 PARAM_STATE = ParameterState()
@@ -521,13 +624,13 @@ def stream_frames():
         if gray is None:
             time.sleep(0.01)
             continue
-        frame = render_halftone_frame(gray, params)
+        frame, mode = render_halftone_frame(gray, params)
         now = time.time()
         dt = now - last_t
         last_t = now
         if dt > 0:
             fps = 0.9 * fps + 0.1 * (1.0 / dt) if fps > 0 else (1.0 / dt)
-        overlay_params(frame, params["cell"], params["r_min"], params["r_max"], params["gamma"], params["blur_ksize"], fps=fps)
+        overlay_params(frame, params["cell"], params["r_min"], params["r_max"], params["gamma"], params["blur_ksize"], mode=mode, color_hex=params.get("color_hex"), fps=fps)
         SNAPSHOT_BUFFER.update(frame)
         ok, buffer = cv.imencode(".jpg", frame, [cv.IMWRITE_JPEG_QUALITY, 90])
         if not ok:
@@ -536,11 +639,18 @@ def stream_frames():
 
 
 app = Flask(__name__)
+SERVER_SHUTDOWN_EVENT = threading.Event()
 
 
 @app.route("/")
 def index():
-    return render_template("index.html")
+    params = PARAM_STATE.snapshot()
+    return render_template(
+        "index.html",
+        modes=HALFTONE_MODES,
+        default_mode=params["mode"],
+        default_color=params["color_hex"],
+    )
 
 
 @app.route("/stream")
@@ -556,7 +666,6 @@ def api_settings():
         return jsonify({
             "params": params,
             "hardware": hardware,
-            "program_settings": _gather_program_settings(),
         })
 
     payload = request.get_json(silent=True) or {}
@@ -576,10 +685,48 @@ def api_snapshot():
     return jsonify({"success": False, "error": detail}), 400
 
 
+@app.route("/api/shutdown", methods=["POST"])
+def api_shutdown():
+    if SERVER_SHUTDOWN_EVENT.is_set():
+        return jsonify({"success": True, "status": "already_shutting_down"})
+
+    shutdown_func = request.environ.get("werkzeug.server.shutdown")
+    if shutdown_func is None:
+        return jsonify({"success": False, "error": "not_supported"}), 500
+
+    SERVER_SHUTDOWN_EVENT.set()
+
+    def _shutdown():
+        time.sleep(0.1)
+        try:
+            FRAME_SOURCE.release()
+        except Exception:
+            pass
+        try:
+            shutdown_func()
+        except Exception:
+            pass
+
+    threading.Thread(target=_shutdown, daemon=True).start()
+    return jsonify({"success": True})
+
+
 if __name__ == "__main__":
     print_startup_banner()
     display_host = "127.0.0.1" if WEB_HOST in ("", "0.0.0.0") else WEB_HOST
     if WEB_PORT_CHANGED:
         print(f"[INFO] 요청한 포트가 사용 중이라 {WEB_PORT}로 변경되었습니다.")
-    print(f"[INFO] 웹 인터페이스: http://{display_host}:{WEB_PORT}/")
-    app.run(host=WEB_HOST, port=WEB_PORT, threaded=True)
+    url = f"http://{display_host}:{WEB_PORT}/"
+    print(f"[INFO] 웹 인터페이스: {url}")
+
+    def _launch_browser():
+        # 약간의 지연 후 기본 브라우저를 열어 초기 구동 부담을 줄인다.
+        time.sleep(1.0)
+        try:
+            webbrowser.open(url)
+        except Exception:
+            pass
+
+    threading.Thread(target=_launch_browser, daemon=True).start()
+    app.run(host=WEB_HOST, port=WEB_PORT, threaded=True, use_reloader=False)
+    sys.exit(0)

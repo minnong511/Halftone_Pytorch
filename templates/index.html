@@ -13,10 +13,6 @@
     <section id="control-pane">
         <h1>Halftone Controls</h1>
         <div class="section">
-            <h2>Program Settings</h2>
-            <ul id="program-info"></ul>
-        </div>
-        <div class="section">
             <h2>Hardware Acceleration</h2>
             <div id="hardware-info"></div>
         </div>
@@ -40,6 +36,18 @@
             <div class="control">
                 <label for="blur_level">Blur Level<span id="blur_level-value"></span></label>
                 <input id="blur_level" type="range" min="0" max="7" step="1" />
+            </div>
+            <div class="control">
+                <label for="mode">Mode<span id="mode-value">{{ default_mode|upper }}</span></label>
+                <select id="mode">
+                    {% for mode in modes %}
+                    <option value="{{ mode }}" {% if mode == default_mode %}selected{% endif %}>{{ mode|capitalize }}</option>
+                    {% endfor %}
+                </select>
+            </div>
+            <div class="control">
+                <label for="dot_color">Dot Color<span id="color-value">{{ default_color.upper() }}</span></label>
+                <input id="dot_color" type="color" value="{{ default_color }}" />
             </div>
             <button id="snapshot">Save Snapshot</button>
             <div id="status"></div>
