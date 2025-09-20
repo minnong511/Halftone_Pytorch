@@ -6,10 +6,16 @@
 # 어두울수록 큰 점, 밝을수록 작은 점.
 # ============================================================
 
-import cv2 as cv
-import numpy as np
+import atexit
+import os
+import socket
+import threading
 import time
 from pathlib import Path
+
+import cv2 as cv
+import numpy as np
+from flask import Flask, Response, jsonify, render_template, request
 
 # ---- PyTorch(옵션) : GPU 가속용 ----
 try:
@@ -36,20 +42,124 @@ R_MAX       = CELL // 2  # 최대 반경(셀의 절반 이하 권장)
 GAMMA       = 1.0        # 감마(>1이면 밝은 영역 점 더 작아짐)
 BLUR_KSIZE  = 3          # 0이면 블러 없음(예: 3,5로 설정하면 약간 매끈해짐)
 USE_CAMERA  = True       # 카메라 사용. False면 테스트용 합성/이미지 사용
-SAVE_DIR    = Path("./halftone_snaps")
+SAVE_DIR    = Path("halftone_snaps")
 SAVE_DIR.mkdir(exist_ok=True)
 
-# ---------------------------
-# 통합 UI 레이아웃(1개 창): 좌측 1/3 = GUI, 우측 2/3 = 영상
-# ---------------------------
-UI_W_RATIO  = 1/3.0
-VID_W_RATIO = 1 - UI_W_RATIO
-CANVAS_W    = FRAME_W
-CANVAS_H    = FRAME_H
-VID_W       = int(CANVAS_W * VID_W_RATIO)
-UI_W        = CANVAS_W - VID_W
-
 PROC_SCALE = 0.5
+WEB_HOST = os.getenv("HALFTONE_HOST", "0.0.0.0")
+
+
+def _parse_port(value: str | None, default: int) -> int:
+    if not value:
+        return default
+    try:
+        port = int(value)
+        if 1 <= port <= 65535:
+            return port
+    except (TypeError, ValueError):
+        pass
+    return default
+
+
+def _find_available_port(preferred: int, host: str, attempts: int = 20) -> tuple[int, bool]:
+    """Return a port and whether it differs from preferred."""
+    host_to_check = "0.0.0.0" if host in ("", "0.0.0.0") else host
+    port = preferred
+    for _ in range(max(1, attempts)):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                sock.bind((host_to_check, port))
+            except OSError:
+                port += 1
+                if port > 65535:
+                    port = 1024
+                continue
+            else:
+                return port, port != preferred
+    return preferred, False
+
+
+WEB_PORT_INPUT = _parse_port(os.getenv("HALFTONE_PORT"), 5050)
+WEB_PORT, WEB_PORT_CHANGED = _find_available_port(WEB_PORT_INPUT, WEB_HOST)
+
+ASCII_LOGO = r"""
+
+ _   _         _   __  _                         _____   ___  ___  ___
+| | | |       | | / _|| |                       /  __ \ / _ \ |  \/  |
+| |_| |  __ _ | || |_ | |_   ___   _ __    ___  | /  \// /_\ \| .  . |
+|  _  | / _` || ||  _|| __| / _ \ | '_ \  / _ \ | |    |  _  || |\/| |
+| | | || (_| || || |  | |_ | (_) || | | ||  __/ | \__/\| | | || |  | |
+\_| |_/ \__,_||_||_|   \__| \___/ |_| |_| \___|  \____/\_| |_/\_|  |_/
+                                                                      
+                                                                
+"""                                                               
+                                                                 
+
+
+
+def _gather_program_settings() -> list[str]:
+    blur_desc = f"{BLUR_KSIZE}" if BLUR_KSIZE and BLUR_KSIZE > 1 else "off"
+    return [
+        f"Camera Index    : {CAP_INDEX}",
+        f"Frame Size      : {FRAME_W}x{FRAME_H}",
+        f"Cell Size       : {CELL}",
+        f"Radius Range    : {R_MIN}~{R_MAX}",
+        f"Gamma           : {GAMMA}",
+        f"Blur Kernel     : {blur_desc}",
+        f"Processing Scale: {PROC_SCALE}",
+        f"Camera Mode     : {'enabled' if USE_CAMERA else 'static demo'}",
+    ]
+
+
+def _gather_acceleration_info() -> list[tuple[str, str]]:
+    lines = []
+    if TORCH_AVAILABLE and DEVICE is not None:
+        device_name = str(DEVICE)
+        device_label = "GPU" if device_name in ("cuda", "mps") else "CPU"
+        lines.append(("PyTorch", f"{device_name} · {device_label}"))
+    else:
+        lines.append(("PyTorch", "not available (CPU fallback)"))
+
+    cv_cuda_available = False
+    cuda_desc = "not available"
+    if hasattr(cv, "cuda"):
+        try:
+            count = cv.cuda.getCudaEnabledDeviceCount()
+            if count and count > 0:
+                cv_cuda_available = True
+                cuda_desc = "cuda"
+            elif count == 0:
+                cuda_desc = "detected, but no enabled devices"
+        except Exception:
+            cuda_desc = "error while probing"
+    lines.append(("OpenCV CUDA", cuda_desc))
+
+    opencl_desc = "not available"
+    try:
+        if cv.ocl.haveOpenCL():
+            opencl_desc = "enabled" if cv.ocl.useOpenCL() else "available (disabled)"
+    except Exception:
+        opencl_desc = "error while probing"
+    lines.append(("OpenCL", opencl_desc))
+
+    return lines
+
+
+def print_startup_banner():
+    print(ASCII_LOGO.strip("\n"))
+    print("=" * 78)
+    print("PROGRAM SETTINGS")
+    print("-" * 78)
+    for line in _gather_program_settings():
+        print(line)
+    print("=" * 78)
+    print("HARDWARE ACCELERATION")
+    print("-" * 78)
+    for label, status in _gather_acceleration_info():
+        print(f"{label:<14} | {status}")
+    print("=" * 78)
+    print()
 
 def _gaussian_kernel2d(ksize: int, sigma: float | None = None):
     """Create a 2D Gaussian kernel as torch.Tensor shape (1,1,k,k)."""
@@ -172,383 +282,6 @@ def frame_to_gray(frame_bgr):
     f = cv.resize(frame_bgr, (FRAME_W, FRAME_H), interpolation=cv.INTER_AREA)
     return cv.cvtColor(f, cv.COLOR_BGR2GRAY)
 
-# ---------------------------
-# 커스텀 슬라이더(캔버스 내 그리기 + 마우스 이벤트)
-# ---------------------------
-class Slider:
-    def __init__(self, name, vmin, vmax, vinit, x, y, w, h, step=1.0, as_int=False):
-        self.name = name
-        self.vmin = vmin
-        self.vmax = vmax
-        self.value = np.clip(vinit, vmin, vmax)
-        self.x, self.y = x, y
-        self.w, self.h = w, h
-        self.step = step
-        self.as_int = as_int
-        self.active = False  # 드래그 중 여부
-
-    def _value_to_px(self, v):
-        t = (v - self.vmin) / (self.vmax - self.vmin) if self.vmax > self.vmin else 0.0
-        return int(self.x + 10 + t * (self.w - 20))
-
-    def _px_to_value(self, px):
-        t = (px - (self.x + 10)) / max(1, (self.w - 20))
-        v = self.vmin + np.clip(t, 0, 1) * (self.vmax - self.vmin)
-        if self.as_int:
-            v = round(v / self.step) * self.step
-        return np.clip(v, self.vmin, self.vmax)
-
-    def handle_mouse(self, event, mx, my):
-        if event == cv.EVENT_LBUTTONDOWN:
-            if self.y <= my <= self.y + self.h and self.x <= mx <= self.x + self.w:
-                self.active = True
-                self.value = self._px_to_value(mx)
-        elif event == cv.EVENT_MOUSEMOVE and self.active:
-            self.value = self._px_to_value(mx)
-        elif event == cv.EVENT_LBUTTONUP:
-            self.active = False
-
-    def read(self):
-        return int(self.value) if self.as_int else float(self.value)
-
-    def draw(self, img):
-        # 바탕
-        cv.rectangle(img, (self.x, self.y), (self.x + self.w, self.y + self.h), (35, 35, 35), -1)
-        # 라벨
-        label = f"{self.name}: {int(self.value) if self.as_int else self.value:.2f}" if not self.as_int else f"{self.name}: {int(self.value)}"
-        cv.putText(img, label, (self.x + 8, self.y + 18), cv.FONT_HERSHEY_SIMPLEX, 0.5, (220, 220, 220), 1, cv.LINE_AA)
-        # 트랙
-        cy = self.y + self.h // 2 + 8
-        cv.line(img, (self.x + 10, cy), (self.x + self.w - 10, cy), (80, 80, 80), 2)
-        # 핸들
-        hx = self._value_to_px(self.value)
-        cv.circle(img, (hx, cy), 7, (180, 180, 180), -1)
-
-
-class UIButton:
-    def __init__(self, label: str, x: int, y: int, w: int, h: int):
-        self.label = label
-        self.x, self.y = x, y
-        self.w, self.h = w, h
-        self.active = False
-        self.hover = False
-        self._clicked = False
-
-    def _contains(self, mx: int, my: int) -> bool:
-        return self.x <= mx <= self.x + self.w and self.y <= my <= self.y + self.h
-
-    def handle_mouse(self, event, mx, my):
-        inside = self._contains(mx, my)
-
-        if event == cv.EVENT_MOUSEMOVE:
-            self.hover = inside or self.active
-        elif event == cv.EVENT_LBUTTONDOWN:
-            if inside:
-                self.active = True
-                self.hover = True
-            else:
-                self.hover = False
-        elif event == cv.EVENT_LBUTTONUP:
-            if self.active and inside:
-                self._clicked = True
-            self.active = False
-            self.hover = inside
-
-        # 마우스가 버튼을 벗어났고 드래그 중이 아니면 hover 해제
-        if not inside and not self.active and event == cv.EVENT_MOUSEMOVE:
-            self.hover = False
-
-    def consume_click(self) -> bool:
-        if self._clicked:
-            self._clicked = False
-            return True
-        return False
-
-    def draw(self, img):
-        base_color = (60, 60, 60)
-        hover_color = (80, 80, 80)
-        active_color = (100, 100, 100)
-
-        color = base_color
-        if self.active:
-            color = active_color
-        elif self.hover:
-            color = hover_color
-
-        cv.rectangle(img, (self.x, self.y), (self.x + self.w, self.y + self.h), color, -1)
-        cv.rectangle(img, (self.x, self.y), (self.x + self.w, self.y + self.h), (140, 140, 140), 1)
-
-        text_scale = 0.6
-        text_thickness = 2
-        text_color = (230, 230, 230)
-        (tw, th), baseline = cv.getTextSize(self.label, cv.FONT_HERSHEY_SIMPLEX, text_scale, text_thickness)
-        tx = self.x + (self.w - tw) // 2
-        ty = self.y + (self.h + th) // 2 - baseline
-        cv.putText(img, self.label, (tx, ty), cv.FONT_HERSHEY_SIMPLEX, text_scale, text_color, text_thickness, cv.LINE_AA)
-
-def build_sliders():
-    # 레이아웃
-    margin = 12
-    sw = UI_W - 2 * margin
-    sh = 36
-    x0 = margin
-    y0 = 20
-    gap = 10
-
-    sliders = {}
-    sliders["CELL"]      = Slider("CELL",       4, 64, CELL, x0, y0 + 0*(sh+gap), sw, sh, step=1, as_int=True)
-    sliders["R_MIN"]     = Slider("R_MIN",      0, 32, R_MIN, x0, y0 + 1*(sh+gap), sw, sh, step=1, as_int=True)
-    sliders["R_MAX"]     = Slider("R_MAX",      1, 32, min(R_MAX, CELL//2), x0, y0 + 2*(sh+gap), sw, sh, step=1, as_int=True)
-    sliders["GAMMA"]     = Slider("GAMMA",    0.2, 3.0, GAMMA, x0, y0 + 3*(sh+gap), sw, sh, step=0.1, as_int=False)
-    sliders["BLUR_LVL"]  = Slider("BLUR_LVL",   0, 7, 0 if (BLUR_KSIZE is None or BLUR_KSIZE < 2) else (BLUR_KSIZE - 1)//2,
-                                   x0, y0 + 4*(sh+gap), sw, sh, step=1, as_int=True)
-    return sliders
-
-def read_params_from_sliders(sliders):
-    cell  = int(sliders["CELL"].read())
-    rmax  = int(sliders["R_MAX"].read())
-    rmin  = int(sliders["R_MIN"].read())
-    gamma = float(sliders["GAMMA"].read())
-    blur_lvl = int(sliders["BLUR_LVL"].read())
-
-    # 안전 보정
-    cell = max(4, min(64, cell))
-    rmax = min(rmax, cell // 2, 32)
-    rmin = min(rmin, rmax)
-    gamma = max(0.2, min(3.0, gamma))
-    blur_ksize = 0 if blur_lvl <= 0 else 2*blur_lvl + 1
-    return cell, rmin, rmax, gamma, blur_ksize
-
-def draw_ui_panel(panel, sliders, exit_button, fps=None):
-    # 패널 배경
-    panel[:] = (20, 20, 20)
-    # 타이틀
-    cv.putText(panel, "HALFTONE CONTROLS", (12, 16), cv.FONT_HERSHEY_SIMPLEX, 0.55, (240,240,240), 1, cv.LINE_AA)
-    # 슬라이더들
-    for sl in sliders.values():
-        sl.draw(panel)
-    # FPS
-    if fps is not None:
-        text_y = exit_button.y - 12
-        if text_y < 40:
-            text_y = 40
-        cv.putText(panel, f"FPS: {fps:.1f}", (12, text_y), cv.FONT_HERSHEY_SIMPLEX, 0.55, (200,200,200), 1, cv.LINE_AA)
-    exit_button.draw(panel)
-
-def make_mouse_callback(sliders, exit_button):
-    def _cb(event, x, y, flags, param):
-        exit_button.handle_mouse(event, x, y)
-        for sl in sliders.values():
-            sl.handle_mouse(event, x, y)
-    return _cb
-
-def run_unified_loop(get_gray_frame_func):
-    # 슬라이더 준비
-    sliders = build_sliders()
-    button_margin = 12
-    button_height = 44
-    button_width = UI_W - 2 * button_margin
-    button_y = CANVAS_H - button_height - button_margin
-    exit_button = UIButton("EXIT", button_margin, button_y, button_width, button_height)
-    win_name = "Halftone (Unified)"
-    cv.namedWindow(win_name, cv.WINDOW_NORMAL)
-    cv.resizeWindow(win_name, CANVAS_W, CANVAS_H)
-    cv.setMouseCallback(win_name, make_mouse_callback(sliders, exit_button))
-
-    # 디바이스 안내 1회 출력
-    if TORCH_AVAILABLE:
-        print(f"[Halftone GPU] Using device: {DEVICE}")
-    else:
-        print("[Halftone GPU] PyTorch not available -> CPU path")
-
-    fps = 0.0
-    last_t = time.time()
-
-    while True:
-        gray = get_gray_frame_func()
-        if gray is None:
-            break
-
-        cell, rmin, rmax, gamma, blur_ksize = read_params_from_sliders(sliders)
-        H, W = gray.shape
-        use_gpu = TORCH_AVAILABLE and DEVICE is not None and str(DEVICE) in ("cuda", "mps")
-
-        if PROC_SCALE < 1.0:
-            W2 = max(64, int(W * PROC_SCALE))
-            H2 = max(48, int(H * PROC_SCALE))
-            gray_s = cv.resize(gray, (W2, H2), interpolation=cv.INTER_AREA)
-            # 파라미터 스케일 적용
-            cell_s = max(2, int(round(cell * PROC_SCALE)))
-            rmax_s = max(1, int(round(rmax * PROC_SCALE)))
-            rmin_s = max(0, int(round(rmin * PROC_SCALE)))
-            rmax_s = min(rmax_s, cell_s // 2, 32)
-            rmin_s = min(rmin_s, rmax_s)
-            # 블러 커널 스케일
-            if blur_ksize and blur_ksize > 1:
-                k = max(1, int(round(blur_ksize * PROC_SCALE)))
-                blur_ksize_s = k if (k % 2 == 1) else (k + 1)
-            else:
-                blur_ksize_s = 0
-            if use_gpu:
-                ht_small = halftone_gray_gpu(gray_s, cell_s, rmin_s, rmax_s, gamma, blur_ksize_s, DEVICE)
-            else:
-                ht_small = halftone_gray(gray_s, cell=cell_s, r_min=rmin_s, r_max=rmax_s, gamma=gamma, blur_ksize=blur_ksize_s)
-            ht_resized = cv.resize(ht_small, (VID_W, CANVAS_H), interpolation=cv.INTER_NEAREST)
-        else:
-            if use_gpu:
-                ht = halftone_gray_gpu(gray, cell, rmin, rmax, gamma, blur_ksize, DEVICE)
-            else:
-                ht = halftone_gray(gray, cell=cell, r_min=rmin, r_max=rmax, gamma=gamma, blur_ksize=blur_ksize)
-            ht_resized = cv.resize(ht, (VID_W, CANVAS_H), interpolation=cv.INTER_AREA)
-
-        # UI 패널 생성 및 그리기
-        panel = np.zeros((CANVAS_H, UI_W, 3), dtype=np.uint8)
-        # FPS 업데이트
-        now = time.time()
-        dt = now - last_t
-        last_t = now
-        if dt > 0:
-            fps = 0.9 * fps + 0.1 * (1.0 / dt) if fps > 0 else (1.0 / dt)
-        draw_ui_panel(panel, sliders, exit_button, fps=fps)
-
-        # 합성: [패널 | 영상]
-        canvas = np.hstack([panel, ht_resized])
-        cv.imshow(win_name, canvas)
-
-        key = cv.waitKey(10) & 0xFF
-        if exit_button.consume_click():
-            break
-        if key == ord('q'):
-            break
-        elif key == ord('s'):
-            ts = time.strftime("%Y%m%d_%H%M%S")
-            path = SAVE_DIR / f"halftone_{ts}.png"
-            cv.imwrite(str(path), ht)
-            print(f"[저장] {path}")
-
-    cv.destroyWindow(win_name)
-
-# ---------------------------
-# OpenCV 트랙바 기반 GUI
-# ---------------------------
-def _noop(x):
-    pass
-
-def _blurlevel_to_ksize(level: int) -> int:
-    """0 -> 0(블러 없음), n -> 2*n+1 (홀수 커널)"""
-    return 0 if level <= 0 else 2 * level + 1
-
-def create_control_panel():
-    cv.namedWindow("Controls", cv.WINDOW_NORMAL)
-    cv.resizeWindow("Controls", 400, 250)
-
-    # 초기값 준비
-    init_cell = int(max(4, min(64, CELL)))
-    init_rmax = int(min(R_MAX, init_cell // 2, 32))
-    init_rmin = int(min(R_MIN, init_rmax))
-    init_gamma10 = int(max(2, min(30, round(GAMMA * 10))))
-    init_blur_lvl = 0 if (BLUR_KSIZE is None or BLUR_KSIZE < 2) else (BLUR_KSIZE - 1) // 2
-    init_blur_lvl = int(max(0, min(7, init_blur_lvl)))
-
-    cv.createTrackbar("CELL",       "Controls", init_cell,   64, _noop)      # 4~64 (정규화에서 하한 강제)
-    cv.createTrackbar("R_MIN",      "Controls", init_rmin,   32, _noop)      # 0~32
-    cv.createTrackbar("R_MAX",      "Controls", init_rmax,   32, _noop)      # 1~32 (정규화에서 CELL/2와 동기)
-    cv.createTrackbar("GAMMA_x10",  "Controls", init_gamma10, 30, _noop)     # 0~30 → 0.0~3.0 (정규화에서 0.2~3.0)
-    cv.createTrackbar("BLUR_LVL",   "Controls", init_blur_lvl, 7, _noop)     # 0(off)~7 → ksize=0/3/5/.../15
-
-def read_safe_params_from_trackbar():
-    """트랙바 값을 읽은 뒤 안전 구간으로 정규화하여 반환."""
-    cell     = cv.getTrackbarPos("CELL",      "Controls")
-    rmin     = cv.getTrackbarPos("R_MIN",     "Controls")
-    rmax     = cv.getTrackbarPos("R_MAX",     "Controls")
-    gamma10  = cv.getTrackbarPos("GAMMA_x10", "Controls")
-    blur_lvl = cv.getTrackbarPos("BLUR_LVL",  "Controls")
-
-    # 정규화/보정
-    cell = max(4, min(64, cell if cell > 0 else 4))
-    rmax = min(rmax, cell // 2, 32)
-    rmin = min(rmin, rmax)
-    gamma = max(0.2, min(3.0, gamma10 / 10.0))
-    blur_ksize = _blurlevel_to_ksize(blur_lvl)
-
-    return cell, rmin, rmax, gamma, blur_ksize
-
-# ---------------------------
-# Split-window UI: Controls (trackbars) + Render
-# ---------------------------
-def run_split_windows_loop(get_gray_frame_func):
-    """Split-window UI: 'Controls' (trackbars) + 'Halftone' (render).
-    Trackbar changes apply immediately because we poll them every loop with waitKey(1).
-    """
-    # Ensure control window exists
-    try:
-        cv.getTrackbarPos("CELL", "Controls")
-    except Exception:
-        create_control_panel()
-
-    render_win = "Halftone"
-    cv.namedWindow(render_win, cv.WINDOW_NORMAL)
-    cv.resizeWindow(render_win, FRAME_W, FRAME_H)
-
-    fps = 0.0
-    last_t = time.time()
-
-    use_gpu_possible = TORCH_AVAILABLE and DEVICE is not None and str(DEVICE) in ("cuda", "mps")
-
-    while True:
-        gray = get_gray_frame_func()
-        if gray is None:
-            break
-
-        cell, rmin, rmax, gamma, blur_ksize = read_safe_params_from_trackbar()
-
-        # Optional downscale for speed
-        if PROC_SCALE < 1.0:
-            W = max(64, int(gray.shape[1] * PROC_SCALE))
-            H = max(48, int(gray.shape[0] * PROC_SCALE))
-            gray_s = cv.resize(gray, (W, H), interpolation=cv.INTER_AREA)
-            cell_s = max(2, int(round(cell * PROC_SCALE)))
-            rmax_s = max(1, int(round(rmax * PROC_SCALE)))
-            rmin_s = max(0, int(round(rmin * PROC_SCALE)))
-            rmax_s = min(rmax_s, cell_s // 2, 32)
-            rmin_s = min(rmin_s, rmax_s)
-            if blur_ksize and blur_ksize > 1:
-                k = max(1, int(round(blur_ksize * PROC_SCALE)))
-                blur_s = k if (k % 2 == 1) else (k + 1)
-            else:
-                blur_s = 0
-            if use_gpu_possible:
-                out_small = halftone_gray_gpu(gray_s, cell_s, rmin_s, rmax_s, gamma, blur_s, DEVICE)
-            else:
-                out_small = halftone_gray(gray_s, cell=cell_s, r_min=rmin_s, r_max=rmax_s, gamma=gamma, blur_ksize=blur_s)
-            out = cv.resize(out_small, (FRAME_W, FRAME_H), interpolation=cv.INTER_NEAREST)
-        else:
-            if use_gpu_possible:
-                out = halftone_gray_gpu(gray, cell, rmin, rmax, gamma, blur_ksize, DEVICE)
-            else:
-                out = halftone_gray(gray, cell=cell, r_min=rmin, r_max=rmax, gamma=gamma, blur_ksize=blur_ksize)
-
-        # FPS overlay (small, top-left)
-        now = time.time()
-        dt = now - last_t
-        last_t = now
-        if dt > 0:
-            fps = 0.9 * fps + 0.1 * (1.0 / dt) if fps > 0 else (1.0 / dt)
-        cv.putText(out, f"FPS:{fps:.1f}", (10, 20), cv.FONT_HERSHEY_SIMPLEX, 0.6, (200,200,200), 1, cv.LINE_AA)
-
-        cv.imshow(render_win, out)
-
-        # Super-short GUI timeslice keeps UI snappy
-        key = cv.waitKey(1) & 0xFF
-        if key == ord('q'):
-            break
-        elif key == ord('s'):
-            ts = time.strftime("%Y%m%d_%H%M%S")
-            path = SAVE_DIR / f"halftone_{ts}.png"
-            cv.imwrite(str(path), out)
-            print(f"[저장] {path}")
-
-    cv.destroyWindow(render_win)
 
 def overlay_params(img, cell, rmin, rmax, gamma, blur_ksize, fps=None):
     """현재 파라미터를 화면 좌상단에 텍스트로 표시."""
@@ -563,44 +296,290 @@ def overlay_params(img, cell, rmin, rmax, gamma, blur_ksize, fps=None):
         cv.putText(img, line, (10, y), cv.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 200), 1, cv.LINE_AA)
         y += 20
 
-def demo_camera():
-    cap = cv.VideoCapture(CAP_INDEX)
-    cap.set(cv.CAP_PROP_FRAME_WIDTH, FRAME_W)
-    cap.set(cv.CAP_PROP_FRAME_HEIGHT, FRAME_H)
 
-    if not cap.isOpened():
-        print("[경고] 카메라를 열 수 없습니다. 권한 설정 또는 CAP_INDEX 확인.")
-        return
+class ParameterState:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.cell = CELL
+        self.r_min = R_MIN
+        self.r_max = min(R_MAX, CELL // 2)
+        self.gamma = GAMMA
+        self.blur_level = 0 if (BLUR_KSIZE is None or BLUR_KSIZE < 2) else (BLUR_KSIZE - 1) // 2
 
-    def _get_gray():
-        ok, frame = cap.read()
-        if not ok:
-            print("[에러] 프레임 캡처 실패")
-            return None
-        return frame_to_gray(frame)
+    def _normalize_locked(self):
+        self.cell = int(max(4, min(64, self.cell)))
+        self.r_max = int(max(1, min(self.r_max, self.cell // 2, 32)))
+        self.r_min = int(max(0, min(self.r_min, self.r_max)))
+        self.gamma = float(max(0.2, min(3.0, self.gamma)))
+        self.blur_level = int(max(0, min(7, self.blur_level)))
 
-    print("[키/버튼] q 또는 EXIT: 종료, s: 스냅샷 저장")
-    create_control_panel()
-    run_split_windows_loop(_get_gray)
-    cap.release()
+    def snapshot(self) -> dict:
+        with self.lock:
+            self._normalize_locked()
+            blur_ksize = 0 if self.blur_level <= 0 else 2 * self.blur_level + 1
+            return {
+                "cell": self.cell,
+                "r_min": self.r_min,
+                "r_max": self.r_max,
+                "gamma": self.gamma,
+                "blur_level": self.blur_level,
+                "blur_ksize": blur_ksize,
+            }
 
-def demo_test_static():
-    H, W = FRAME_H, FRAME_W
-    grad = np.tile(np.linspace(0, 255, W, dtype=np.uint8), (H, 1))
-    y0, y1 = H // 3, 2 * H // 3
-    x0, x1 = W // 3, 2 * W // 3
-    grad[y0:y1, x0:x1] = 0
+    def update(self, payload: dict) -> list[str]:
+        if not isinstance(payload, dict):
+            return []
 
-    def _get_gray():
+        changed = set()
+        with self.lock:
+            original = {
+                "cell": self.cell,
+                "r_min": self.r_min,
+                "r_max": self.r_max,
+                "gamma": self.gamma,
+                "blur_level": self.blur_level,
+            }
+
+            if "cell" in payload:
+                try:
+                    new_val = int(payload["cell"])
+                except (TypeError, ValueError):
+                    new_val = original["cell"]
+                if new_val != self.cell:
+                    self.cell = new_val
+                    changed.add("cell")
+
+            if "r_max" in payload:
+                try:
+                    new_val = int(payload["r_max"])
+                except (TypeError, ValueError):
+                    new_val = original["r_max"]
+                if new_val != self.r_max:
+                    self.r_max = new_val
+                    changed.add("r_max")
+
+            if "r_min" in payload:
+                try:
+                    new_val = int(payload["r_min"])
+                except (TypeError, ValueError):
+                    new_val = original["r_min"]
+                if new_val != self.r_min:
+                    self.r_min = new_val
+                    changed.add("r_min")
+
+            if "gamma" in payload:
+                try:
+                    new_val = float(payload["gamma"])
+                except (TypeError, ValueError):
+                    new_val = original["gamma"]
+                if new_val != self.gamma:
+                    self.gamma = new_val
+                    changed.add("gamma")
+
+            if "blur_level" in payload:
+                try:
+                    new_val = int(payload["blur_level"])
+                except (TypeError, ValueError):
+                    new_val = original["blur_level"]
+                if new_val != self.blur_level:
+                    self.blur_level = new_val
+                    changed.add("blur_level")
+
+            self._normalize_locked()
+
+            normalized = {
+                "cell": self.cell,
+                "r_min": self.r_min,
+                "r_max": self.r_max,
+                "gamma": self.gamma,
+                "blur_level": self.blur_level,
+            }
+
+        for key, value in normalized.items():
+            if original[key] != value:
+                changed.add(key)
+
+        return sorted(changed)
+
+
+class FrameSource:
+    def __init__(self, use_camera: bool):
+        self.lock = threading.Lock()
+        self.use_camera = use_camera
+        self.cap = None
+        self._warned_camera_failure = False
+        self.static_gray = self._build_static_pattern()
+        if use_camera:
+            cap = cv.VideoCapture(CAP_INDEX)
+            cap.set(cv.CAP_PROP_FRAME_WIDTH, FRAME_W)
+            cap.set(cv.CAP_PROP_FRAME_HEIGHT, FRAME_H)
+            if cap.isOpened():
+                self.cap = cap
+            else:
+                print("[경고] 카메라를 열 수 없습니다. 정적 패턴으로 전환합니다.")
+                self.use_camera = False
+        if not self.use_camera or self.cap is None:
+            self.use_camera = False
+
+    @staticmethod
+    def _build_static_pattern():
+        H, W = FRAME_H, FRAME_W
+        grad = np.tile(np.linspace(0, 255, W, dtype=np.uint8), (H, 1))
+        y0, y1 = H // 3, 2 * H // 3
+        x0, x1 = W // 3, 2 * W // 3
+        grad[y0:y1, x0:x1] = 0
         return grad
 
-    print("[키/버튼] q 또는 EXIT: 종료, s: 스냅샷 저장")
-    create_control_panel()
-    run_split_windows_loop(_get_gray)
+    def get_gray(self) -> np.ndarray:
+        if self.cap is not None:
+            with self.lock:
+                ok, frame = self.cap.read()
+            if ok:
+                return frame_to_gray(frame)
+            if not self._warned_camera_failure:
+                print("[에러] 카메라 프레임 캡처 실패. 정적 패턴으로 전환합니다.")
+                self._warned_camera_failure = True
+            self.release()
+        return self.static_gray.copy()
+
+    def release(self):
+        if self.cap is not None:
+            with self.lock:
+                self.cap.release()
+            self.cap = None
+
+
+class SnapshotBuffer:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.frame: np.ndarray | None = None
+
+    def update(self, frame: np.ndarray):
+        with self.lock:
+            self.frame = frame.copy()
+
+    def save(self):
+        with self.lock:
+            if self.frame is None:
+                return False, "no_frame"
+            ts = time.strftime("%Y%m%d_%H%M%S")
+            path = SAVE_DIR / f"halftone_{ts}.png"
+            ok = cv.imwrite(str(path), self.frame)
+            if not ok:
+                return False, "write_failed"
+            return True, str(path)
+
+
+def render_halftone_frame(gray: np.ndarray, params: dict) -> np.ndarray:
+    cell = params["cell"]
+    rmin = params["r_min"]
+    rmax = params["r_max"]
+    gamma = params["gamma"]
+    blur_ksize = params["blur_ksize"]
+    use_gpu = TORCH_AVAILABLE and DEVICE is not None and str(DEVICE) in ("cuda", "mps")
+
+    if PROC_SCALE < 1.0:
+        W2 = max(64, int(gray.shape[1] * PROC_SCALE))
+        H2 = max(48, int(gray.shape[0] * PROC_SCALE))
+        gray_s = cv.resize(gray, (W2, H2), interpolation=cv.INTER_AREA)
+        cell_s = max(2, int(round(cell * PROC_SCALE)))
+        rmax_s = max(1, int(round(rmax * PROC_SCALE)))
+        rmin_s = max(0, int(round(rmin * PROC_SCALE)))
+        rmax_s = min(rmax_s, cell_s // 2, 32)
+        rmin_s = min(rmin_s, rmax_s)
+        if blur_ksize and blur_ksize > 1:
+            k = max(1, int(round(blur_ksize * PROC_SCALE)))
+            blur_s = k if (k % 2 == 1) else (k + 1)
+        else:
+            blur_s = 0
+        if use_gpu:
+            ht_small = halftone_gray_gpu(gray_s, cell_s, rmin_s, rmax_s, gamma, blur_s, DEVICE)
+        else:
+            ht_small = halftone_gray(gray_s, cell=cell_s, r_min=rmin_s, r_max=rmax_s, gamma=gamma, blur_ksize=blur_s)
+        frame = cv.resize(ht_small, (FRAME_W, FRAME_H), interpolation=cv.INTER_NEAREST)
+    else:
+        if use_gpu:
+            frame = halftone_gray_gpu(gray, cell, rmin, rmax, gamma, blur_ksize, DEVICE)
+        else:
+            frame = halftone_gray(gray, cell=cell, r_min=rmin, r_max=rmax, gamma=gamma, blur_ksize=blur_ksize)
+
+    return frame
+
+
+PARAM_STATE = ParameterState()
+FRAME_SOURCE = FrameSource(USE_CAMERA)
+SNAPSHOT_BUFFER = SnapshotBuffer()
+atexit.register(FRAME_SOURCE.release)
+
+
+def stream_frames():
+    fps = 0.0
+    last_t = time.time()
+    while True:
+        params = PARAM_STATE.snapshot()
+        gray = FRAME_SOURCE.get_gray()
+        if gray is None:
+            time.sleep(0.01)
+            continue
+        frame = render_halftone_frame(gray, params)
+        now = time.time()
+        dt = now - last_t
+        last_t = now
+        if dt > 0:
+            fps = 0.9 * fps + 0.1 * (1.0 / dt) if fps > 0 else (1.0 / dt)
+        overlay_params(frame, params["cell"], params["r_min"], params["r_max"], params["gamma"], params["blur_ksize"], fps=fps)
+        SNAPSHOT_BUFFER.update(frame)
+        ok, buffer = cv.imencode(".jpg", frame, [cv.IMWRITE_JPEG_QUALITY, 90])
+        if not ok:
+            continue
+        yield b"--frame\r\n" b"Content-Type: image/jpeg\r\n\r\n" + buffer.tobytes() + b"\r\n"
+
+
+app = Flask(__name__)
+
+
+@app.route("/")
+def index():
+    return render_template("index.html")
+
+
+@app.route("/stream")
+def stream():
+    return Response(stream_frames(), mimetype="multipart/x-mixed-replace; boundary=frame")
+
+
+@app.route("/api/settings", methods=["GET", "POST"])
+def api_settings():
+    if request.method == "GET":
+        params = PARAM_STATE.snapshot()
+        hardware = [{"label": label, "status": status} for label, status in _gather_acceleration_info()]
+        return jsonify({
+            "params": params,
+            "hardware": hardware,
+            "program_settings": _gather_program_settings(),
+        })
+
+    payload = request.get_json(silent=True) or {}
+    changed = PARAM_STATE.update(payload)
+    params = PARAM_STATE.snapshot()
+    return jsonify({
+        "params": params,
+        "changed": changed,
+    })
+
+
+@app.route("/api/snapshot", methods=["POST"])
+def api_snapshot():
+    ok, detail = SNAPSHOT_BUFFER.save()
+    if ok:
+        return jsonify({"success": True, "path": detail})
+    return jsonify({"success": False, "error": detail}), 400
+
 
 if __name__ == "__main__":
-    # macOS에서 첫 실행 시 '터미널(또는 파이썬)'의 카메라 권한을 허용해야 함
-    if USE_CAMERA:
-        demo_camera()
-    else:
-        demo_test_static()
+    print_startup_banner()
+    display_host = "127.0.0.1" if WEB_HOST in ("", "0.0.0.0") else WEB_HOST
+    if WEB_PORT_CHANGED:
+        print(f"[INFO] 요청한 포트가 사용 중이라 {WEB_PORT}로 변경되었습니다.")
+    print(f"[INFO] 웹 인터페이스: http://{display_host}:{WEB_PORT}/")
+    app.run(host=WEB_HOST, port=WEB_PORT, threaded=True)
