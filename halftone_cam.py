@@ -35,20 +35,36 @@ except Exception as _e:
 # ---------------------------
 # 파라미터(합리적 기본값)
 # ---------------------------
-CAP_INDEX   = 1          # 내장 카메라 기본 인덱스
+CLEAR_CAMERA_LIST_CACHE_SEC = 10
+CAMERA_SCAN_LIMIT = 8
+CAP_INDEX   = 0          # 내장 카메라 기본 인덱스
 FRAME_W     = 720
 FRAME_H     = 480
-CELL        = 36         # 셀 크기(픽셀)
+PROC_SCALE = 1.0
+HALFTONE_MODES = ("square", "circle", "diamond", "ascii")
+HALFTONE_PRESETS = [
+    {"id": "coarse",   "label": "Coarse",   "cell": 28},
+    {"id": "standard", "label": "Standard", "cell": 20},
+    {"id": "fine",     "label": "Fine",     "cell": 14},
+    {"id": "micro",    "label": "Micro",    "cell": 10},
+]
+DEFAULT_PRESET_ID = "standard"
+DEFAULT_DOT_COLOR = "#ffffff"
+
+def _default_cell() -> int:
+    for preset in HALFTONE_PRESETS:
+        if preset["id"] == DEFAULT_PRESET_ID:
+            return int(preset.get("cell", 20))
+    return 20
+
+CELL        = _default_cell()  # 셀 크기(픽셀)
 R_MIN       = 0          # 최소 반경
 R_MAX       = CELL // 2  # 최대 반경(셀의 절반 이하 권장)
 GAMMA       = 1.0        # 감마(>1이면 밝은 영역 점 더 작아짐)
-BLUR_KSIZE  = 3          # 0이면 블러 없음(예: 3,5로 설정하면 약간 매끈해짐)
+BLUR_KSIZE  = 0          # 0이면 블러 없음
 USE_CAMERA  = True       # 카메라 사용. False면 테스트용 합성/이미지 사용
 SAVE_DIR    = Path("halftone_snaps")
 SAVE_DIR.mkdir(exist_ok=True)
-
-PROC_SCALE = 0.5
-HALFTONE_MODES = ("square", "circle", "diamond", "ascii")
 DEFAULT_DOT_COLOR = "#ffffff"
 WEB_HOST = os.getenv("HALFTONE_HOST", "0.0.0.0")
 
@@ -347,6 +363,9 @@ class ParameterState:
         self.mode = HALFTONE_MODES[0]
         self.color_hex = DEFAULT_DOT_COLOR
         self._color_bgr = self._hex_to_bgr(self.color_hex)
+        self.preset_id = None
+        self.apply_preset(DEFAULT_PRESET_ID)
+        self._normalize_locked()
 
     def _normalize_locked(self):
         self.cell = int(max(4, min(64, self.cell)))
@@ -358,6 +377,21 @@ class ParameterState:
             self.mode = HALFTONE_MODES[0]
         self.color_hex = self._normalize_hex(self.color_hex)
         self._color_bgr = self._hex_to_bgr(self.color_hex)
+
+    def apply_preset(self, preset_id: str) -> bool:
+        preset = next((p for p in HALFTONE_PRESETS if p["id"] == preset_id), None)
+        if preset is None:
+            return False
+        self.cell = int(preset.get("cell", self.cell))
+        self.r_max = int(preset.get("r_max", self.cell // 2))
+        self.r_min = int(preset.get("r_min", R_MIN))
+        self.gamma = float(preset.get("gamma", GAMMA))
+        if "blur_level" in preset:
+            self.blur_level = int(preset["blur_level"])
+        else:
+            self.blur_level = 0
+        self.preset_id = preset_id
+        return True
 
     def snapshot(self) -> dict:
         with self.lock:
@@ -373,6 +407,7 @@ class ParameterState:
                 "color_hex": self.color_hex,
                 "color_bgr": list(self._color_bgr),
                 "blur_ksize": blur_ksize,
+                "preset_id": self.preset_id,
             }
 
     def update(self, payload: dict) -> list[str]:
@@ -389,7 +424,18 @@ class ParameterState:
                 "blur_level": self.blur_level,
                 "mode": self.mode,
                 "color_hex": self.color_hex,
+                "preset_id": self.preset_id,
             }
+
+            if "preset" in payload:
+                preset_val = str(payload["preset"]).lower()
+                if preset_val == "custom":
+                    if self.preset_id is not None:
+                        self.preset_id = None
+                        changed.add("preset_id")
+                else:
+                    if self.apply_preset(preset_val):
+                        changed.update({"preset_id", "cell", "r_max", "r_min", "blur_level"})
 
             if "cell" in payload:
                 try:
@@ -398,6 +444,7 @@ class ParameterState:
                     new_val = original["cell"]
                 if new_val != self.cell:
                     self.cell = new_val
+                    self.preset_id = None
                     changed.add("cell")
 
             if "r_max" in payload:
@@ -407,6 +454,7 @@ class ParameterState:
                     new_val = original["r_max"]
                 if new_val != self.r_max:
                     self.r_max = new_val
+                    self.preset_id = None
                     changed.add("r_max")
 
             if "r_min" in payload:
@@ -416,6 +464,7 @@ class ParameterState:
                     new_val = original["r_min"]
                 if new_val != self.r_min:
                     self.r_min = new_val
+                    self.preset_id = None
                     changed.add("r_min")
 
             if "gamma" in payload:
@@ -425,6 +474,7 @@ class ParameterState:
                     new_val = original["gamma"]
                 if new_val != self.gamma:
                     self.gamma = new_val
+                    self.preset_id = None
                     changed.add("gamma")
 
             if "blur_level" in payload:
@@ -434,6 +484,7 @@ class ParameterState:
                     new_val = original["blur_level"]
                 if new_val != self.blur_level:
                     self.blur_level = new_val
+                    self.preset_id = None
                     changed.add("blur_level")
 
             if "mode" in payload:
@@ -462,6 +513,7 @@ class ParameterState:
                 "blur_level": self.blur_level,
                 "mode": self.mode,
                 "color_hex": self.color_hex,
+                "preset_id": self.preset_id,
             }
 
         for key, value in normalized.items():
@@ -523,6 +575,26 @@ class FrameSource:
         x0, x1 = W // 3, 2 * W // 3
         grad[y0:y1, x0:x1] = 0
         return grad
+
+    def open_camera(self, index: int) -> bool:
+        with self.lock:
+            if self.cap is not None:
+                if int(self.cap.get(cv.CAP_PROP_POS_MSEC)) != index:
+                    self.cap.release()
+                    self.cap = None
+            cap = cv.VideoCapture(index)
+            cap.set(cv.CAP_PROP_FRAME_WIDTH, FRAME_W)
+            cap.set(cv.CAP_PROP_FRAME_HEIGHT, FRAME_H)
+            if cap.isOpened():
+                self.cap = cap
+                self.use_camera = True
+                self._warned_camera_failure = False
+                try:
+                    self.cap.set(cv.CAP_PROP_POS_MSEC, index)
+                except Exception:
+                    pass
+                return True
+            return False
 
     def get_gray(self) -> np.ndarray:
         if self.cap is not None:
@@ -640,6 +712,24 @@ def stream_frames():
 
 app = Flask(__name__)
 SERVER_SHUTDOWN_EVENT = threading.Event()
+CAMERA_CACHE = {"timestamp": 0.0, "cameras": []}
+
+
+def list_cameras(max_devices: int = CAMERA_SCAN_LIMIT) -> list[dict]:
+    now = time.time()
+    if now - CAMERA_CACHE["timestamp"] < CLEAR_CAMERA_LIST_CACHE_SEC and CAMERA_CACHE["cameras"]:
+        return CAMERA_CACHE["cameras"]
+
+    cameras = []
+    for idx in range(max_devices):
+        cap = cv.VideoCapture(idx)
+        if cap.isOpened():
+            name = f"Camera {idx}"
+            cameras.append({"id": idx, "label": name})
+            cap.release()
+    CAMERA_CACHE["cameras"] = cameras
+    CAMERA_CACHE["timestamp"] = now
+    return cameras
 
 
 @app.route("/")
@@ -648,8 +738,12 @@ def index():
     return render_template(
         "index.html",
         modes=HALFTONE_MODES,
+        presets=HALFTONE_PRESETS,
         default_mode=params["mode"],
         default_color=params["color_hex"],
+        cameras=list_cameras(),
+        default_camera=params.get("camera_index", CAP_INDEX),
+        default_preset=params.get("preset_id"),
     )
 
 
@@ -666,9 +760,36 @@ def api_settings():
         return jsonify({
             "params": params,
             "hardware": hardware,
+            "cameras": list_cameras(),
+            "presets": HALFTONE_PRESETS,
         })
 
     payload = request.get_json(silent=True) or {}
+    if "camera_index" in payload:
+        try:
+            cam_idx = int(payload["camera_index"])
+        except (TypeError, ValueError):
+            cam_idx = CAP_INDEX
+        if FRAME_SOURCE.open_camera(cam_idx):
+            payload = {k: v for k, v in payload.items() if k != "camera_index"}
+            PARAM_STATE.preset_id = PARAM_STATE.preset_id  # no-op to keep structure
+            response = PARAM_STATE.snapshot()
+            response["camera_index"] = cam_idx
+            hardware = [{"label": label, "status": status} for label, status in _gather_acceleration_info()]
+            response_payload = {
+                "params": response,
+                "hardware": hardware,
+                "cameras": list_cameras(),
+                "presets": HALFTONE_PRESETS,
+                "changed": ["camera_index"],
+            }
+            if payload:
+                changed = PARAM_STATE.update(payload)
+                updated = PARAM_STATE.snapshot()
+                updated["camera_index"] = cam_idx
+                response_payload["params"] = updated
+                response_payload["changed"] = sorted(set(response_payload["changed"]) | set(changed))
+            return jsonify(response_payload)
     changed = PARAM_STATE.update(payload)
     params = PARAM_STATE.snapshot()
     return jsonify({

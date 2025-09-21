@@ -44,6 +44,8 @@ const modeSelect = document.getElementById('mode');
 const modeDisplay = document.getElementById('mode-value');
 const colorInput = document.getElementById('dot_color');
 const colorDisplay = document.getElementById('color-value');
+const presetSelect = document.getElementById('preset');
+const cameraSelect = document.getElementById('camera');
 
 function applyParams(params) {
     Object.entries(paramMeta).forEach(([key, config]) => {
@@ -84,6 +86,22 @@ function applyParams(params) {
         }
         if (colorDisplay) {
             colorDisplay.textContent = hex.toUpperCase();
+        }
+    }
+    if (presetSelect) {
+        const presetId = params.preset_id ? params.preset_id : 'custom';
+        if (presetSelect.value !== presetId) {
+            const options = Array.from(presetSelect.options).map((opt) => opt.value);
+            presetSelect.value = options.includes(presetId) ? presetId : 'custom';
+        }
+    }
+    if ('camera_index' in params && cameraSelect) {
+        const camId = params.camera_index;
+        if (cameraSelect.value !== String(camId)) {
+            const options = Array.from(cameraSelect.options).map((opt) => opt.value);
+            if (options.includes(String(camId))) {
+                cameraSelect.value = String(camId);
+            }
         }
     }
     statusEl.textContent = '';
@@ -215,5 +233,26 @@ window.addEventListener('pagehide', (event) => {
 window.addEventListener('beforeunload', () => {
     requestShutdown();
 });
+
+if (presetSelect) {
+    presetSelect.addEventListener('change', (ev) => {
+        const value = ev.target.value;
+        if (value === 'custom') {
+            sendPartialUpdate('preset', 'custom');
+            return;
+        }
+        sendPartialUpdate('preset', value);
+    });
+}
+
+if (cameraSelect) {
+    cameraSelect.addEventListener('change', (ev) => {
+        const value = parseInt(ev.target.value, 10);
+        if (Number.isNaN(value)) {
+            return;
+        }
+        sendPartialUpdate('camera_index', value);
+    });
+}
 
 fetchSettings();

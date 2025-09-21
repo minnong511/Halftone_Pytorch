@@ -13,10 +13,27 @@
     <section id="control-pane">
         <h1>Halftone Controls</h1>
         <div class="section">
+            <div class="control">
+                <label for="camera">Camera</label>
+                <select id="camera">
+                    {% for cam in cameras %}
+                    <option value="{{ cam.id }}" {% if cam.id == default_camera %}selected{% endif %}>{{ cam.label }}</option>
+                    {% endfor %}
+                </select>
+            </div>
             <h2>Hardware Acceleration</h2>
             <div id="hardware-info"></div>
         </div>
         <div class="section">
+            <div class="control">
+                <label for="preset">Preset</label>
+                <select id="preset">
+                    <option value="custom" {% if default_preset is none %}selected{% endif %}>Custom</option>
+                    {% for preset in presets %}
+                    <option value="{{ preset.id }}" {% if preset.id == default_preset %}selected{% endif %}>{{ preset.label }}</option>
+                    {% endfor %}
+                </select>
+            </div>
             <div class="control">
                 <label for="cell">Cell<span id="cell-value"></span></label>
                 <input id="cell" type="range" min="4" max="64" step="1" />
